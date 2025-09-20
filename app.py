@@ -7,6 +7,8 @@ import requests
 import subprocess
 import streamlit as st
 import tempfile
+import random
+import string
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -71,18 +73,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- Sidebar ---
-with st.sidebar:
-    st.header("Settings")
-    display_name = st.text_input("Display name (for file names)", value="fileName")
-    default_filename = st.text_input("Default output filename (no extension)", value=f"{display_name}_story")
-    st.markdown("---")
-    st.subheader("Generation options")
-    num_scenes_expected = st.selectbox("Expected number of scenes (model hint)", options=[1, 2, 3], index=1)
-    ffmpeg_overwrite = st.checkbox("Force overwrite (ffmpeg -y)", value=True)
-    st.markdown("⚠️ Make sure `ffmpeg` is installed and available in PATH.")
 
-st.markdown("Write a short description or topic and press **Generate Video**. Use the sidebar to customize settings.")
+st.markdown("Write a short description or topic and press **Generate Video**. Filenames will be generated randomly.")
 
 # --- Inputs & progress placeholder ---
 video_topic = st.text_input("Enter a video topic:", placeholder="e.g., A robot learning to paint a sunset")
@@ -92,8 +84,12 @@ progress_bar = st.progress(0)
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = None
 
+# --- Generate random filename function ---
+def random_filename(length=8):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
 # --- Core generation function ---
-def generate_video(topic, openai_api_key, expected_scenes=2, ffmpeg_force_overwrite=True):
+def generate_video(topic, openai_api_key, expected_scenes=5, ffmpeg_force_overwrite=True):
     """
     Generate video & images, return dict:
       { video_bytes, images: [{name, bytes}], error (or None) }
@@ -182,7 +178,6 @@ def generate_video(topic, openai_api_key, expected_scenes=2, ffmpeg_force_overwr
 
                 proc = subprocess.run(ffmpeg_command, capture_output=True, text=True)
                 if proc.returncode != 0:
-                    # Return error but keep generated images so user can download them
                     return {"video_bytes": None, "images": images_for_download, "error": f"FFmpeg failed while creating scene {scene_number} (see server logs)."}
                 intermediate_video_files.append(output_video_path)
 
@@ -199,14 +194,12 @@ def generate_video(topic, openai_api_key, expected_scenes=2, ffmpeg_force_overwr
 
             result = subprocess.run(concat_command, capture_output=True, text=True)
 
-            # If concat copy fails, try re-encoding fallback (more robust)
             if result.returncode != 0:
                 reencode_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", filelist_path, "-c:v", "libx264", "-c:a", "aac", final_video_path]
                 reproc = subprocess.run(reencode_cmd, capture_output=True, text=True)
                 if reproc.returncode != 0:
                     return {"video_bytes": None, "images": images_for_download, "error": "Final FFmpeg assembly failed (see server logs)."}
 
-            # Read final video into memory BEFORE tmp cleanup
             if not os.path.exists(final_video_path):
                 return {"video_bytes": None, "images": images_for_download, "error": "Final video not created."}
 
@@ -232,9 +225,8 @@ if st.button("Generate Video", type="primary"):
     else:
         api_key = st.secrets["OPENAI_API_KEY"]
         with st.spinner("Generating your cinematic short... ✨"):
-            result = generate_video(video_topic, api_key, expected_scenes=num_scenes_expected, ffmpeg_force_overwrite=ffmpeg_overwrite)
+            result = generate_video(video_topic, api_key)
 
-        # Save to session_state so results persist across reruns (downloads won't clear them)
         st.session_state["last_result"] = result
 
         if result["error"]:
@@ -242,19 +234,18 @@ if st.button("Generate Video", type="primary"):
         else:
             st.success("🎉 Video Generated Successfully!")
 
-# --- If we have a stored result, show it (persists across reruns & downloads) ---
+# --- Show results ---
 if st.session_state.get("last_result"):
     res = st.session_state["last_result"]
     if res.get("error"):
         st.error(res["error"])
     else:
-        safe_filename = (default_filename.strip() or f"{display_name}_story").strip()
-        mp4_name = f"{safe_filename}.mp4"
+        random_file = random_filename()
+        mp4_name = f"{random_file}.mp4"
 
         st.markdown("### Preview")
         st.video(res["video_bytes"])
 
-        # Video download button
         st.download_button(
             label="⬇️ Download Video",
             data=res["video_bytes"],
@@ -263,7 +254,6 @@ if st.session_state.get("last_result"):
             help="Click to download the generated MP4"
         )
 
-        # Download images as ZIP
         if res.get("images"):
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -274,23 +264,17 @@ if st.session_state.get("last_result"):
             st.download_button(
                 label="⬇️ Download All Images (ZIP)",
                 data=zip_buffer,
-                file_name=f"{safe_filename}_images.zip",
+                file_name=f"{random_file}_images.zip",
                 mime="application/zip",
                 help="All generated scene images in a zip"
             )
 
-            # Show images as thumbnails persisted from session state
             st.markdown("### Scenes")
             cols = st.columns(min(3, len(res["images"])))
             for idx, img in enumerate(res["images"]):
                 col = cols[idx % len(cols)]
-                # using use_container_width to avoid deprecation warning
                 col.image(img["bytes"], caption=f"{img['name']}", use_container_width=True)
 
-        # Clear results button
         if st.button("Clear Results"):
             st.session_state["last_result"] = None
             st.experimental_rerun()
-
-st.markdown("---")
-
