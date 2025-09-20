@@ -1,127 +1,296 @@
 # app.py
 import os
+import io
 import json
+import zipfile
 import requests
 import subprocess
 import streamlit as st
-import tempfile # Use tempfile for better cross-platform compatibility
+import tempfile
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from requests.exceptions import RequestException # For better error handling
+from requests.exceptions import RequestException
 
-# --- Main App Interface ---
+# --- Page config & CSS ---
 st.set_page_config(page_title="AI Storyteller", page_icon="🎬", layout="centered")
-st.title("🎬 AI Storyteller Video Generator")
-st.markdown("Turn your ideas into short videos. Enter a topic below and let the AI do the rest!")
 
-# User input for the video topic
+st.markdown(
+    """
+    <style>
+    body {
+        background: linear-gradient(180deg, #0f172a 0%, #071037 100%);
+        color: #e6eef8;
+    }
+    .header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+    }
+    .title {
+        font-size: 28px;
+        font-weight: 700;
+        margin: 0;
+    }
+    .subtitle {
+        font-size: 13px;
+        color: #bcd3ff;
+        margin: 0;
+    }
+    .card {
+        background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));
+        border-radius: 14px;
+        padding: 12px;
+        box-shadow: 0 4px 18px rgba(2,6,23,0.6);
+        margin-bottom: 12px;
+    }
+    .btn-primary {
+        background: linear-gradient(90deg, #7c3aed, #06b6d4);
+        color: white;
+        padding: 8px 14px;
+        border-radius: 10px;
+    }
+    .small-muted { color: #9fb0d9; font-size: 13px; }
+    .scene-caption { font-weight:600; font-size:14px; color:#eaf2ff; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="header">
+        <div style="font-size:40px">🎬</div>
+        <div>
+            <div class="title">AI Storyteller</div>
+            <div class="subtitle">Turn ideas into short cinematic videos — fast and beautifully.</div>
+        </div>
+    </div>
+    <br>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- Sidebar ---
+with st.sidebar:
+    st.header("Settings")
+    display_name = st.text_input("Display name (for file names)", value="Vikesh")
+    default_filename = st.text_input("Default output filename (no extension)", value=f"{display_name}_story")
+    st.markdown("---")
+    st.subheader("Generation options")
+    num_scenes_expected = st.selectbox("Expected number of scenes (model hint)", options=[1, 2, 3], index=1)
+    ffmpeg_overwrite = st.checkbox("Force overwrite (ffmpeg -y)", value=True)
+    st.markdown("⚠️ Make sure `ffmpeg` is installed and available in PATH.")
+
+st.markdown("Write a short description or topic and press **Generate Video**. Use the sidebar to customize settings.")
+
+# --- Inputs & progress placeholder ---
 video_topic = st.text_input("Enter a video topic:", placeholder="e.g., A robot learning to paint a sunset")
+progress_bar = st.progress(0)
 
-# --- Core Video Generation Logic ---
-def generate_video(topic, openai_api_key):
+# initialize session state for persistence
+if "last_result" not in st.session_state:
+    st.session_state["last_result"] = None
+
+# --- Core generation function ---
+def generate_video(topic, openai_api_key, expected_scenes=2, ffmpeg_force_overwrite=True):
     """
-    The main function to generate the video from a topic.
-    This function will be called when the button is pressed.
+    Generate video & images, return dict:
+      { video_bytes, images: [{name, bytes}], error (or None) }
     """
-    with st.status("🎬 Let's make a movie...", expanded=True) as status:
-        try:
-            # --- 1. Initialize Clients ---
-            langchain_client = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=openai_api_key)
-            openai_client = OpenAI(api_key=openai_api_key)
-            
-            # Use a temporary directory to store files for this session
-            with tempfile.TemporaryDirectory() as temp_dir:
-                status.update(label="🤖 Generating script...")
-                
-                # --- 2. Create the Prompt Template for the Script ---
-                prompt_template = ChatPromptTemplate.from_messages([
-                    ("system", 
-                     "You are a helpful assistant that generates short, 2-scene video scripts. "
-                     "Your output must be a valid JSON object. "
-                     "Each scene object must have an 'image_prompt' and a 'voiceover_text'. "
-                     "The 'image_prompt' must be a highly detailed description for an AI image generator, "
-                     "aiming for a photorealistic, cinematic style with dramatic lighting. "
-                     "Think like a film director specifying a shot."),
-                    ("human", "Here is the topic: {topic}"),
-                ])
+    try:
+        langchain_client = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=openai_api_key)
+        openai_client = OpenAI(api_key=openai_api_key)
 
-                # --- 3. Run the Script Generation Chain ---
-                script_generation_chain = prompt_template | langchain_client
-                response = script_generation_chain.invoke({"topic": topic})
-                script_text_response = response.content
+        with tempfile.TemporaryDirectory() as temp_dir:
+            progress_bar.progress(5)
 
-                # --- 4. Parse the Script and Generate Media ---
-                json_start_index = script_text_response.find('{')
-                json_end_index = script_text_response.rfind('}') + 1
-                json_only_string = script_text_response[json_start_index:json_end_index]
-                storyboard = json.loads(json_only_string)
-                scenes = storyboard.get("scenes", [])
+            # Prompt template
+            prompt_template = ChatPromptTemplate.from_messages([
+                ("system",
+                 "You are a helpful assistant that generates short, 2-scene video scripts. "
+                 "Your output must be a valid JSON object. "
+                 "Each scene object must have an 'image_prompt' and a 'voiceover_text'. "
+                 "The 'image_prompt' must be a highly detailed description for an AI image generator, "
+                 "aiming for a photorealistic, cinematic style with dramatic lighting. "
+                 "Think like a film director specifying a shot."),
+                ("human", "Here is the topic: {topic}"),
+            ])
 
-                intermediate_video_files = []
-                for i, scene in enumerate(scenes):
-                    scene_number = i + 1
-                    
-                    # --- Image Generation ---
-                    status.update(label=f"🎨 Generating image for scene {scene_number}...")
-                    image_prompt = scene.get("image_prompt")
-                    image_response = openai_client.images.generate(model="dall-e-3", prompt=image_prompt, size="1024x1024", quality="standard", n=1)
-                    image_url = image_response.data[0].url
-                    
-                    # Download the image
-                    image_data = requests.get(image_url, timeout=30).content
-                    image_file_path = os.path.join(temp_dir, f"scene_{scene_number}.png")
-                    with open(image_file_path, "wb") as f: f.write(image_data)
-                    st.image(image_file_path, caption=f"Scene {scene_number}")
+            # Run model to get storyboard JSON
+            script_generation_chain = prompt_template | langchain_client
+            response = script_generation_chain.invoke({"topic": topic})
+            script_text_response = response.content
 
-                    # --- Audio Generation ---
-                    status.update(label=f"🎤 Generating audio for scene {scene_number}...")
-                    voiceover_text = scene.get("voiceover_text")
-                    audio_response = openai_client.audio.speech.create(model="tts-1", voice="alloy", input=voiceover_text)
-                    audio_file_path = os.path.join(temp_dir, f"scene_{scene_number}.mp3")
-                    audio_response.stream_to_file(audio_file_path)
+            # Parse JSON robustly
+            json_start_index = script_text_response.find('{')
+            json_end_index = script_text_response.rfind('}') + 1
+            if json_start_index == -1 or json_end_index == -1:
+                raise json.JSONDecodeError("Could not find JSON in model response", script_text_response, 0)
+            json_only_string = script_text_response[json_start_index:json_end_index]
+            storyboard = json.loads(json_only_string)
+            scenes = storyboard.get("scenes", [])
+            if not scenes:
+                raise ValueError("No scenes found in the storyboard JSON.")
 
-                    # --- Create Intermediate Video Clip for the Scene ---
-                    status.update(label=f"🎞️ Creating video clip for scene {scene_number}...")
-                    output_video_path = os.path.join(temp_dir, f"scene_{scene_number}.mp4")
-                    ffmpeg_command = ["ffmpeg", "-loop", "1", "-i", image_file_path, "-i", audio_file_path, "-c:v", "libx264", "-tune", "stillimage", "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p", "-shortest", output_video_path, "-y"]
-                    subprocess.run(ffmpeg_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    intermediate_video_files.append(output_video_path)
-                
-                # --- 5. Assemble the Final Video ---
-                status.update(label="🎬 Assembling the final video...")
-                filelist_path = os.path.join(temp_dir, "filelist.txt")
-                with open(filelist_path, "w") as f:
-                    for file in intermediate_video_files:
-                        f.write(f"file '{os.path.basename(file)}'\n")
+            progress_bar.progress(15)
 
-                final_video_path = os.path.join(temp_dir, "final_video.mp4")
-                concat_command = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", filelist_path, "-c", "copy", final_video_path, "-y"]
-                subprocess.run(concat_command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            intermediate_video_files = []
+            images_for_download = []
 
-                # Return the final video path so it can be displayed
-                return final_video_path
-        
-        except (RequestException, json.JSONDecodeError, IndexError, subprocess.CalledProcessError, Exception) as e:
-            st.error(f"An error occurred during video generation: {e}", icon="🚨")
-            status.update(label="Error!", state="error")
-            return None
+            for i, scene in enumerate(scenes):
+                scene_number = i + 1
+                progress_bar.progress(15 + int((i / max(1, len(scenes))) * 60))
 
-# The button to start the process
+                # Image generation
+                image_prompt = scene.get("image_prompt")
+                if not image_prompt:
+                    raise ValueError(f"Scene {scene_number} missing 'image_prompt'")
+                image_response = openai_client.images.generate(model="dall-e-3", prompt=image_prompt, size="1024x1024", quality="standard", n=1)
+                image_url = image_response.data[0].url
+                image_data = requests.get(image_url, timeout=30).content
+                image_file_path = os.path.join(temp_dir, f"scene_{scene_number}.png")
+                with open(image_file_path, "wb") as f:
+                    f.write(image_data)
+
+                # collect image bytes for download
+                images_for_download.append({"name": f"scene_{scene_number}.png", "bytes": image_data})
+
+                # Audio generation
+                voiceover_text = scene.get("voiceover_text", "")
+                audio_response = openai_client.audio.speech.create(model="tts-1", voice="alloy", input=voiceover_text)
+                audio_file_path = os.path.join(temp_dir, f"scene_{scene_number}.mp3")
+                audio_response.stream_to_file(audio_file_path)
+
+                # Create scene video using ffmpeg
+                output_video_path = os.path.join(temp_dir, f"scene_{scene_number}.mp4")
+                ffmpeg_command = [
+                    "ffmpeg",
+                    "-loop", "1",
+                    "-i", image_file_path,
+                    "-i", audio_file_path,
+                    "-c:v", "libx264",
+                    "-tune", "stillimage",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-pix_fmt", "yuv420p",
+                    "-shortest",
+                    output_video_path
+                ]
+                if ffmpeg_force_overwrite:
+                    ffmpeg_command.insert(1, "-y")
+
+                proc = subprocess.run(ffmpeg_command, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    # Return error but keep generated images so user can download them
+                    return {"video_bytes": None, "images": images_for_download, "error": f"FFmpeg failed while creating scene {scene_number} (see server logs)."}
+                intermediate_video_files.append(output_video_path)
+
+            # Assemble final video
+            filelist_path = os.path.join(temp_dir, "filelist.txt")
+            with open(filelist_path, "w") as f:
+                for file in intermediate_video_files:
+                    f.write(f"file '{file}'\n")
+
+            final_video_path = os.path.join(temp_dir, "final_video.mp4")
+            concat_command = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", filelist_path, "-c", "copy", final_video_path]
+            if ffmpeg_force_overwrite:
+                concat_command.insert(1, "-y")
+
+            result = subprocess.run(concat_command, capture_output=True, text=True)
+
+            # If concat copy fails, try re-encoding fallback (more robust)
+            if result.returncode != 0:
+                reencode_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", filelist_path, "-c:v", "libx264", "-c:a", "aac", final_video_path]
+                reproc = subprocess.run(reencode_cmd, capture_output=True, text=True)
+                if reproc.returncode != 0:
+                    return {"video_bytes": None, "images": images_for_download, "error": "Final FFmpeg assembly failed (see server logs)."}
+
+            # Read final video into memory BEFORE tmp cleanup
+            if not os.path.exists(final_video_path):
+                return {"video_bytes": None, "images": images_for_download, "error": "Final video not created."}
+
+            with open(final_video_path, "rb") as vf:
+                video_bytes = vf.read()
+
+            progress_bar.progress(100)
+            return {"video_bytes": video_bytes, "images": images_for_download, "error": None}
+
+    except subprocess.CalledProcessError as e:
+        return {"video_bytes": None, "images": [], "error": "FFmpeg error occurred (see server logs)."}
+    except (RequestException, json.JSONDecodeError, IndexError, ValueError) as e:
+        return {"video_bytes": None, "images": [], "error": f"Generation error: {e}"}
+    except Exception as e:
+        return {"video_bytes": None, "images": [], "error": f"Unexpected error: {e}"}
+
+# --- Action: Generate ---
 if st.button("Generate Video", type="primary"):
-    # Check for API key first
     if "OPENAI_API_KEY" not in st.secrets:
         st.error("OpenAI API key not found. Please add it to your Streamlit secrets.", icon="🔒")
     elif not video_topic:
         st.warning("Please enter a topic for the video.", icon="⚠️")
     else:
-        # Get the API key from secrets
         api_key = st.secrets["OPENAI_API_KEY"]
-        final_video_path = generate_video(video_topic, api_key)
-        
-        if final_video_path:
+        with st.spinner("Generating your cinematic short... ✨"):
+            result = generate_video(video_topic, api_key, expected_scenes=num_scenes_expected, ffmpeg_force_overwrite=ffmpeg_overwrite)
+
+        # Save to session_state so results persist across reruns (downloads won't clear them)
+        st.session_state["last_result"] = result
+
+        if result["error"]:
+            st.error(result["error"])
+        else:
             st.success("🎉 Video Generated Successfully!")
-            # Read the video file into memory to display it
-            video_file = open(final_video_path, 'rb')
-            video_bytes = video_file.read()
-            st.video(video_bytes)
+
+# --- If we have a stored result, show it (persists across reruns & downloads) ---
+if st.session_state.get("last_result"):
+    res = st.session_state["last_result"]
+    if res.get("error"):
+        st.error(res["error"])
+    else:
+        safe_filename = (default_filename.strip() or f"{display_name}_story").strip()
+        mp4_name = f"{safe_filename}.mp4"
+
+        st.markdown("### Preview")
+        st.video(res["video_bytes"])
+
+        # Video download button
+        st.download_button(
+            label="⬇️ Download Video",
+            data=res["video_bytes"],
+            file_name=mp4_name,
+            mime="video/mp4",
+            help="Click to download the generated MP4"
+        )
+
+        # Download images as ZIP
+        if res.get("images"):
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for img in res["images"]:
+                    zf.writestr(img["name"], img["bytes"])
+            zip_buffer.seek(0)
+
+            st.download_button(
+                label="⬇️ Download All Images (ZIP)",
+                data=zip_buffer,
+                file_name=f"{safe_filename}_images.zip",
+                mime="application/zip",
+                help="All generated scene images in a zip"
+            )
+
+            # Show images as thumbnails persisted from session state
+            st.markdown("### Scenes")
+            cols = st.columns(min(3, len(res["images"])))
+            for idx, img in enumerate(res["images"]):
+                col = cols[idx % len(cols)]
+                # using use_container_width to avoid deprecation warning
+                col.image(img["bytes"], caption=f"{img['name']}", use_container_width=True)
+
+        # Clear results button
+        if st.button("Clear Results"):
+            st.session_state["last_result"] = None
+            st.experimental_rerun()
+
+st.markdown("---")
+
