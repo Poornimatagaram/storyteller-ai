@@ -74,7 +74,7 @@ st.markdown(
 # --- Sidebar ---
 with st.sidebar:
     st.header("Settings")
-    display_name = st.text_input("Display name (for file names)", value="Vikesh")
+    display_name = st.text_input("Display name (for file names)", value="fileName")
     default_filename = st.text_input("Default output filename (no extension)", value=f"{display_name}_story")
     st.markdown("---")
     st.subheader("Generation options")
